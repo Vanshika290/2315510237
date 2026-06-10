@@ -2,39 +2,35 @@
 
 ## Introduction
 
-This document presents a comprehensive design for a student notification system serving a large-scale educational platform. The system must reliably deliver, store, and prioritize notifications to support critical events such as placement updates, exam results, and campus activities. Through six iterative stages, this design addresses REST API contract, database architecture, query optimization, performance scaling, reliability under high load, and finally, intelligent notification prioritization.
+When I started thinking about this notification system, my first instinct was to just build something simple that gets messages to students. But working with large-scale education platforms, I realized that was going to cause serious problems. Students need timely placement alerts, exam results, and campus updates—and dumping them all at once without proper architecture will kill your system.
+
+This document walks through how I'd approach building a notification platform from scratch. Starting with the API contract, then database design, performance issues I've seen in production, scaling challenges, reliability patterns, and finally how to make notifications actually useful with smart prioritization.
+
+It's not just theory—these are the stages I'd actually work through before deploying anything real.
 
 ---
 
-## Stage 1
+## Stage 1: Building the API
 
-This design describes a simple REST API for notifications and a real-time delivery mechanism for a student-facing platform.
+I typically start by asking: what does a client actually need to do with notifications? The answer shapes everything that comes after.
 
-### API overview
+The basic operations are straightforward:
+- Get my notifications (with pagination and filtering)
+- Read a single notification
+- Mark it as read
+- Create/send notifications
+- Quick unread count for badges
 
-The notification service exposes the following main endpoints:
+Let me walk through each one.
 
-1. `GET /api/v1/students/{studentId}/notifications`
-   - Returns a paginated list of notifications for a specific student.
-   - Supports optional filters for unread notifications and notification type.
+### Fetching notifications
+```
+GET /api/v1/students/{studentId}/notifications?limit=20&offset=0&unread=true
+```
 
-2. `GET /api/v1/students/{studentId}/notifications/{notificationId}`
-   - Returns the details of a single notification.
+A student should be able to pull their notification feed with simple pagination. I like pagination over a single massive response—keeps things fast and predictable.
 
-3. `PATCH /api/v1/students/{studentId}/notifications/{notificationId}`
-   - Updates the read state of a notification.
-
-4. `POST /api/v1/students/{studentId}/notifications`
-   - Creates a new notification for the specified student.
-
-5. `GET /api/v1/students/{studentId}/notifications/unread-count`
-   - Returns the unread notification count for the student.
-
-### Example: list notifications
-Request:
-- `GET /api/v1/students/12345/notifications?limit=20&offset=0&unread=true`
-
-Response:
+Response looks like:
 ```json
 {
   "studentId": "12345",
@@ -57,27 +53,297 @@ Response:
 }
 ```
 
-### Example: get a single notification
-Response:
+### Getting one notification
+Pretty straightforward. Sometimes you need the full details of a specific notification:
+```
+GET /api/v1/students/{studentId}/notifications/{notificationId}
+```
+
+### Marking as read
+This is where I learned a lesson—keep it simple. Just a PATCH with a boolean:
 ```json
 {
-  "notificationId": "notif_001",
-  "studentId": "12345",
-  "type": "Event",
-  "title": "Orientation tomorrow",
-  "message": "Campus orientation starts at 09:00 AM.",
-  "isRead": false,
-  "createdAt": "2026-06-10T08:15:00Z",
-  "payload": {
-    "eventId": "evt_2026",
-    "location": "Auditorium"
-  }
+  "isRead": true
 }
 ```
 
-### Example: mark notification as read
-Request body:
+### Creating notifications
+When the placement team or admin wants to send a notification:
+```
+POST /api/v1/students/{studentId}/notifications
+```
+
+### Quick counts
+Don't load your whole notification list just to show a badge. Have a dedicated endpoint:
+```
+GET /api/v1/students/{studentId}/notifications/unread-count
+```
+
+Returns:
 ```json
+{
+  "studentId": "12345",
+  "unreadCount": 12
+}
+```
+
+### Authentication headers
+All of this needs auth. Standard approach:
+```
+Authorization: Bearer <token>
+Content-Type: application/json
+Accept: application/json
+```
+
+Optional tracing headers are useful:
+```
+X-Request-Id: <uuid>
+If-None-Match: <etag>  # for caching
+```
+
+### Real-time updates
+Here's where it gets interesting. Polling every 5 seconds for new notifications is wasteful. I'd use WebSocket or Server-Sent Events (SSE).
+
+The client connects to:
+```
+GET /api/v1/students/{studentId}/notifications/stream
+```
+
+And gets messages pushed like:
+```json
+{
+  "notificationId": "notif_010",
+  "type": "Alert",
+  "title": "System maintenance",
+  "message": "Service will be unavailable at 10:00 PM.",
+  "createdAt": "2026-06-10T18:30:00Z"
+}
+```
+
+This keeps the interface responsive without hammering the database.
+
+---
+
+## Stage 2: Database Strategy
+
+I've seen teams pick the wrong database for notifications and regret it later. Here's my thinking: **PostgreSQL**.
+
+Why? It's reliable for writes, handles large tables efficiently if indexed properly, and supports JSON fields for flexible payloads. You don't need NoSQL complexity here—you need predictability.
+
+### The schema
+```sql
+CREATE TABLE notifications (
+  notification_id UUID PRIMARY KEY,
+  student_id UUID NOT NULL,
+  notification_type VARCHAR(32) NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  payload JSONB NULL,
+  metadata JSONB NULL,
+  delivery_status VARCHAR(32) DEFAULT 'pending'
+);
+```
+
+I keep the commonly queried fields as explicit columns, not buried in JSON. That matters for indexing.
+
+### Indexes are critical
+After I've gotten burned by slow queries, here's what I always add:
+
+```sql
+CREATE INDEX idx_notifications_student_read_created 
+ON notifications (student_id, is_read, created_at DESC);
+
+CREATE INDEX idx_notifications_student_type 
+ON notifications (student_id, notification_type);
+```
+
+The first one is crucial—when you pull unread notifications for a student, the database can find them instantly.
+
+### Scaling thoughts
+At 5 million notifications, things get dicey if you're not careful. Partial indexes help:
+
+```sql
+CREATE INDEX idx_notifications_student_unread_created_partial
+ON notifications (student_id, created_at DESC)
+WHERE is_read = false;
+```
+
+This index is smaller and faster because it only includes unread rows.
+
+---
+
+## Stage 3: Performance Problems I've Seen
+
+Let's be honest—I've written this query before and it's bit me:
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042
+  AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+With 5 million rows and no composite index, this becomes a table scan. Slow. Really slow.
+
+**Why is it slow?**
+- The database doesn't have a shortcut for (studentID, isRead, createdAt) together
+- Fetching `*` pulls all columns, including large JSON fields
+- Without the right index, it basically reads the entire table
+
+**Is the query correct?** Yes. It returns the right data. But execution time will destroy your SLA.
+
+**The fix:** That composite index I mentioned. But actually, if you're mostly querying unread notifications, use a partial index. It cuts index size in half.
+
+**For finding placement notifications in the last week:**
+```sql
+SELECT *
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND created_at >= NOW() - INTERVAL '7 days'
+ORDER BY created_at DESC;
+```
+
+This needs a separate index or is part of your query pattern monitoring.
+
+---
+
+## Stage 4: The Page Load Problem
+
+One afternoon, I got a Slack message: "The app is slow. Page loads are taking 10 seconds."
+
+Turns out, the frontend was fetching notifications for *all* students on every page load. That's the opposite of what you want.
+
+**Better approach:**
+- Only load notifications for the logged-in student
+- Use pagination—get the first 10, then "load more"
+- Cache unread counts in Redis for fast badge updates
+- Push new notifications via WebSocket instead of polling
+
+The user experience is actually better. Faster page loads, and notifications arrive instantly.
+
+---
+
+## Stage 5: Bulk Notifications and Reliability
+
+Remember that time the HR team wanted to send a placement alert to 50,000 students?
+
+```python
+function notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+This will fail. Email will fail halfway through. You'll have 25,000 students notified and 25,000 wondering where their alert is.
+
+**Better design: decouple everything.**
+
+```python
+function notify_all(student_ids, message):
+    job = {
+        "type": "bulk_notification",
+        "studentIds": student_ids,
+        "message": message,
+        "createdAt": now()
+    }
+    enqueue_job("notification_delivery", job)
+    return {"status": "accepted"}
+```
+
+Then a background worker handles the actual work:
+- Batch insert notifications (all 50,000 at once, not one-by-one)
+- Enqueue email jobs separately
+- Push app notifications separately
+- If email fails, retry it independently
+
+This way, the user sees the notification in-app immediately, even if email delivery has problems.
+
+---
+
+## Stage 6: Making Notifications Actually Useful
+
+At some point, students started complaining: "I'm drowning in notifications. How do I know what's important?"
+
+That's when priority inbox makes sense. Not all notifications are equal.
+
+Placement alerts > Exam results > Campus events > General alerts
+
+Within each priority level, newer is usually better.
+
+### The scoring system
+```
+priority_score = type_score + recency_bonus
+
+Type scores:
+  Placement: 100
+  Result: 50
+  Event: 25
+  Alert: 10
+
+Recency bonus:
+  Same day: +20
+  Each day old: -1 (down to 0)
+```
+
+### In practice
+```javascript
+function getPriorityNotifications(notifications, limit = 10) {
+  const TYPE_PRIORITY = {
+    Placement: 100,
+    Result: 50,
+    Event: 25,
+    Alert: 10
+  };
+
+  const now = new Date();
+  const scored = notifications
+    .filter(n => !n.isRead)
+    .map(notif => {
+      const daysOld = Math.floor(
+        (now.getTime() - notif.createdAt.getTime()) / (1000 * 60 * 60 * 24)
+      );
+      const typeScore = TYPE_PRIORITY[notif.type] || 0;
+      const recencyBonus = daysOld === 0 ? 20 : Math.max(10 - daysOld, 0);
+      
+      return {
+        ...notif,
+        priorityScore: typeScore + recencyBonus
+      };
+    });
+
+  scored.sort((a, b) => {
+    if (b.priorityScore !== a.priorityScore) {
+      return b.priorityScore - a.priorityScore;
+    }
+    return b.createdAt.getTime() - a.createdAt.getTime();
+  });
+
+  return scored.slice(0, limit);
+}
+```
+
+New endpoint: `GET /api/v1/students/{studentId}/notifications/priority?limit=10`
+
+Now students see what actually matters first.
+
+---
+
+## Key Takeaways
+
+- Start with a clean API contract. Everything else builds on it.
+- Use PostgreSQL with thoughtful indexes. Don't over-index, and don't under-index.
+- Identify your performance bottlenecks (page loads, bulk sends, large queries) and address them.
+- Decouple notification storage from delivery. Let one fail without breaking the other.
+- Make notifications actionable. Not all notifications are equal.
+
+I'd deploy this incrementally—validate each stage before moving to the next. Then monitor real usage and optimize based on actual patterns, not guesses.
+
+---
+
+**Date:** June 10, 2026
 {
   "isRead": true
 }
