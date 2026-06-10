@@ -11,6 +11,7 @@ app.post('/vehicles', (req, res) => {
 
 app.get('/vehicles', (req, res) => {
     res.json(vehicles);
+
 });
 app.get('/vehicles/:id', (req, res) => {
     const id = parseInt(req.params.id);
@@ -23,3 +24,4 @@ app.get('/vehicles/:id', (req, res) => {
 app.listen(3000, () => {
     console.log('Server is running on port 3000');
 });
+
